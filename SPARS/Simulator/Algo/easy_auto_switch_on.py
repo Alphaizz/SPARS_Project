@@ -4,14 +4,24 @@ from bisect import bisect_left
 
 class EASYAuto(FCFSAuto):
     def schedule(self, new_state, waiting_queue, scheduled_queue, resources_agenda):
-        super().prep_schedule(new_state, waiting_queue, scheduled_queue, resources_agenda)
+        # 1. Prepare the scheduling iteration
+        super().prep_schedule(new_state, waiting_queue,
+                              scheduled_queue, resources_agenda)
+        
+        # 2. Run the job scheduler and backfilling
         super().FCFSAuto()
-
         self.backfill()
 
-        if self.timeout is not None:
-            super().timeout_policy()
+        # 3. Apply the Power State Management Policy (THIS IS THE CHANGED PART)
 
+        # --- OLD WAY (using the timeout policy) ---
+        # if self.timeout is not None:
+        #     super().timeout_policy()
+
+        # --- NEW WAY (calling your hybrid policy from BaseAlgorithm) ---
+        super().hybrid_policy()
+
+        # 4. Return the scheduled events
         return self.events
 
     def find_node_combination(self, p_start_t, compute_demand, nodes, next_releases, x):

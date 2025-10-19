@@ -1,3 +1,15 @@
+# =============================================================================
+# INSTRUCTIONS FOR USE:
+# 1. This file now contains a new, more advanced policy called `hybrid_policy`.
+# 2. To use it, you must open your `easy_auto_switch.py` file.
+# 3. In the `schedule` method of that file, change the line that calls the policy to:
+#
+#    super().hybrid_policy()
+#
+# 4. You will also need to set a `timeout` value in your `simulator_config.yaml`
+#    (e.g., 300 seconds) because this policy uses both time and queue length.
+# =============================================================================
+
 import copy
 
 
@@ -37,15 +49,81 @@ class BaseAlgorithm():
                                 if ti.get('node_id') not in ids]
 
     def timeout_policy(self):
+        # This is the original, unmodified timeout policy.
         now = self.current_time
+        t_exp = now + self.timeout
+        allocated_ids = [node['id'] for node in self.allocated]
+        timeout_node_ids = {t['node_id'] for t in self.timeout_list}
+        for node in self.state:
+            if (
+                node['job_id'] is None
+                and node['state'] == 'active'
+                and node['reserved'] == False
+                and node['id'] not in allocated_ids
+                and node['id'] not in timeout_node_ids
+            ):
+                self.timeout_list.append(
+                    {'node_id': node['id'], 'time': t_exp})
+                timeout_node_ids.add(node['id'])
+        state_by_id = {n['id']: n for n in self.state}
+        allocated_ids = {n['id'] for n in self.allocated}
+        switch_off = []
+        keep_timeouts = []
+        next_earliest = None
+        for t in self.timeout_list:
+            node = state_by_id.get(t['node_id'])
+            if not node:
+                continue
+            if now < t['time'] or node['state'] != 'active':
+                keep_timeouts.append(t)
+                if next_earliest is None or t['time'] < next_earliest:
+                    next_earliest = t['time']
+                continue
+            if node['job_id'] is None and node['id'] not in allocated_ids:
+                switch_off.append(node['id'])
+        self.timeout_list = keep_timeouts
+        if switch_off:
+            self.push_event(now, {'type': 'switch_off', 'nodes': switch_off})
+        if next_earliest is not None and getattr(self, 'next_timeout_at', None) != next_earliest:
+            self.push_event(next_earliest, {'type': 'call_me_later'})
+            self.next_timeout_at = next_earliest
 
+    def queue_aware_policy(self):
+        # This is the previous custom policy. It is ineffective when the queue is always full.
+        nodes_to_turn_off = []
+        if len(self.waiting_queue) < 10:
+            for node in self.available:
+                nodes_to_turn_off.append(node['id'])
+        if nodes_to_turn_off:
+            self.push_event(self.current_time, {
+                            'type': 'switch_off', 'nodes': nodes_to_turn_off})
+        nodes_to_turn_on = []
+        if len(self.waiting_queue) > 10:
+            if self.inactive:
+                num_to_turn_on = min(len(self.inactive), 5)
+                for i in range(num_to_turn_on):
+                    nodes_to_turn_on.append(self.inactive[i]['id'])
+        if nodes_to_turn_on:
+            self.push_event(self.current_time, {
+                            'type': 'switch_on', 'nodes': nodes_to_turn_on})
+
+    # =========================================================================
+    # START: NEW HYBRID POWER STATE MANAGEMENT METHOD
+    # =========================================================================
+    def hybrid_policy(self):
+        """
+        This is a more advanced hybrid policy. Its rule is:
+        - Switch off a node ONLY IF it has been idle for a certain `timeout`
+          AND the system load is low (e.g., waiting queue has < 20 jobs).
+        This prevents switching off nodes during busy periods, even if they are
+        temporarily idle, which should create a better balance.
+        """
+        now = self.current_time
         t_exp = now + self.timeout
 
-        # Fast membership on existing timeouts
         allocated_ids = [node['id'] for node in self.allocated]
         timeout_node_ids = {t['node_id'] for t in self.timeout_list}
 
-        # Add timeouts for newly idle, active nodes (no duplicates)
         for node in self.state:
             if (
                 node['job_id'] is None
@@ -58,42 +136,51 @@ class BaseAlgorithm():
                     {'node_id': node['id'], 'time': t_exp})
                 timeout_node_ids.add(node['id'])
 
-        # Build lookups once
         state_by_id = {n['id']: n for n in self.state}
         allocated_ids = {n['id'] for n in self.allocated}
 
         switch_off = []
         keep_timeouts = []
-        next_earliest = None  # track the earliest remaining timeout
+        next_earliest = None
 
         for t in self.timeout_list:
             node = state_by_id.get(t['node_id'])
             if not node:
-                # stale timeout for a node that no longer exists
                 continue
 
-            # keep if not yet expired or node not active
             if now < t['time'] or node['state'] != 'active':
                 keep_timeouts.append(t)
                 if next_earliest is None or t['time'] < next_earliest:
                     next_earliest = t['time']
                 continue
 
-            # expired:
+            # This is the moment a node's idle timer has expired.
+            # We now add the second condition before switching it off.
             if node['job_id'] is None and node['id'] not in allocated_ids:
-                switch_off.append(node['id'])
-            # else: drop the timeout silently
+                # --- HYBRID POLICY CHANGE ---
+                # Check the system load by looking at the waiting queue length.
+                # You can tune this "20" to find the best balance.
+                if len(self.waiting_queue) < 20:
+                    # If the queue is short, it's safe to switch the node off.
+                    switch_off.append(node['id'])
+                else:
+                    # If the queue is long, the system is busy.
+                    # We should keep the node ON and reset its timer for another cycle.
+                    keep_timeouts.append(
+                        {'node_id': node['id'], 'time': now + self.timeout})
+                    if next_earliest is None or (now + self.timeout) < next_earliest:
+                        next_earliest = now + self.timeout
+                # --- END OF HYBRID POLICY CHANGE ---
 
-        # swap in the filtered list
         self.timeout_list = keep_timeouts
-
         if switch_off:
             self.push_event(now, {'type': 'switch_off', 'nodes': switch_off})
-
-        # Schedule exactly one wake-up at the earliest pending timeout
         if next_earliest is not None and getattr(self, 'next_timeout_at', None) != next_earliest:
             self.push_event(next_earliest, {'type': 'call_me_later'})
             self.next_timeout_at = next_earliest
+    # =========================================================================
+    # END: NEW HYBRID POWER STATE MANAGEMENT METHOD
+    # =========================================================================
 
     def prep_schedule(self, new_state, waiting_queue, scheduled_queue, resources_agenda):
         self.state = new_state
@@ -108,55 +195,19 @@ class BaseAlgorithm():
         self.events = []
         self.compute_speeds = [node['compute_speed']
                                for node in self.state]
-
-        """ 
-        GET ALL AVAILABLE NODES (INCLUDES THE RESERVED NODES)
-        THEN CHECK IF A SCHEDULED JOB CAN BE EXECUTED
-        """
         self.available = [
             node for node in self.state
             if node['state'] == 'active' and node['job_id'] is None and node['reserved'] == False
         ]
-
         self.inactive = [
             node for node in self.state
             if node['state'] == 'sleeping' and node['reserved'] == False
         ]
-
-        self.allocated = []  # This tracks the list of allocated nodes in an instance of scheduling, since easy scheduler is executed after fcfs scheduler, we have to make sure easy scheduler doesn't realocate the nodes that already been allocated by fcfs, since fcfs doesnt immediately update simulator's machine, we have to store info of currently allocated nodes in the current instance of scheduling
+        self.allocated = []
         self.scheduled = []
-
         self.reserved_ids = []
         for job in scheduled_queue:
             self.reserved_ids.extend(job['nodes'])
-
-        # if len(self.scheduled_queue) > 0:
-        #     for scheduled_job in self.scheduled_queue:
-        #         executable = True
-        #         for reserved_nodes in scheduled_job['nodes']:
-        #             if reserved_nodes not in self.available:
-        #                 executable = False
-
-        #         if executable:
-        #             allocated_nodes = scheduled_job['nodes']
-        #             self.available = [
-        #                 node for node in self.available if node not in scheduled_job['nodes']]
-        #             self.allocated.extend(scheduled_job['nodes'])
-
-        #             self.scheduled_queue.remove(scheduled_job)
-        #             event = {
-        #                 'job_id': scheduled_job['job_id'],
-        #                 'subtime': scheduled_job['subtime'],
-        #                 'runtime': scheduled_job['runtime'],
-        #                 'res': scheduled_job['res'],
-        #                 'type': 'execution_start',
-        #                 'nodes': allocated_nodes
-        #             }
-        #             self.push_event(self.current_time, event)
-        """ 
-        CONTINUE EXECUTE SCHEDULING LOGIC WITHOUT CONSIDERING THE RESERVED NODES
-        """
-
         self.available = [
             node for node in self.available if node['id'] not in self.reserved_ids
         ]

@@ -1,12 +1,12 @@
 paths:
-  workload: "Tugas_HandsOn/workload.json"
-  platform: "Tugas_HandsOn/platform.json"
-  output: "results/generated_3600"
+  workload: "Tugas_Project/nasa-20-back.json"
+  platform: "Tugas_Project/platform-nasa.json"
+  output: "resultss/run_hybrid"
 
 run:
   algorithm: "easy_auto"
+  timeout: 300
   overrun_policy: "terminate"
-  timeout: 3600
   # start_time can be:
   # - integer epoch (e.g., 0), or
   # - string "YYYY-MM-DD HH:MM:SS" (local), or "now"
